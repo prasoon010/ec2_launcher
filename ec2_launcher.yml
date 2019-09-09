@@ -1,0 +1,225 @@
+---
+- name: "Playbook to create Amazon EC2 linux"
+  hosts: localhost
+  connection: local
+  vars:
+    key_name: devops
+    region: "us-east-2"
+    vpc_name: "my_vpc"
+    vpc_cidr_block: 172.16.0.0/16
+    public_subnet_1_cidr: 172.16.0.0/20
+    public_subnet_2_cidr: 172.16.16.0/20
+    private_subnet_1_cidr: 172.16.32.0/20
+    image: ami-00c03f7f7f2ec15c3
+    instance_type: t2.micro
+
+
+
+  tasks:
+
+    - name: "Create new EC2 key"
+      ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ region }}"
+      register: ec2_key_result
+
+    - name: "Save private key"
+      when: ec2_key_result.changed == true
+      copy:
+        content: "{{ ec2_key_result.key.private_key }}"
+        dest: "./{{ key_name }}.pem"
+        mode: 0600
+
+    - name: "Creating VPC"
+      ec2_vpc_net:
+        name: "{{ vpc_name }}"
+        cidr_block: "{{ vpc_cidr_block }}"
+        region: "{{ region }}"
+        state: present
+      register: vpc_result
+
+    - name: "Set vpc id in variable"
+      set_fact:
+        vpc_id: "{{ vpc_result.vpc.id }}"
+
+    # - name: Wait for 5 Seconds
+    #   wait_for: timeout=5
+
+    - name: "Creating public subnet for bastion server [AZ-1]"
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ public_subnet_1_cidr }}"
+        az: "{{ region }}a"
+        region: "{{ region }}"
+        wait: yes
+        resource_tags:
+           Name: "public_subnet_1"
+      register: public_subnet_az1
+
+    - name: "Set public subnet id in variable [AZ-1]"
+      set_fact:
+        public_subnet_az1_id: "{{ public_subnet_az1.subnet.id }}"
+
+    - name: "Creating public subnet for web server [AZ-2]"
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ public_subnet_2_cidr }}"
+        az: "{{ region }}b"
+        region: "{{ region }}"
+        wait: yes
+        resource_tags:
+           Name: "public_subnet_2"
+      register: public_subnet_az2
+
+    - name: "Set public subnet id in variable [AZ-2]"
+      set_fact:
+        public_subnet_az2_id: "{{ public_subnet_az2.subnet.id }}"
+
+    - name: "Creating private subnet for database server [AZ-3]"
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ private_subnet_1_cidr }}"
+        az: "{{ region }}c"
+        region: "{{ region }}"
+        wait: yes
+        resource_tags:
+           Name: "private_subnet_1"
+      register: private_subnet_az3
+
+    - name: "Set private subnet id in variable [AZ-3]"
+      set_fact:
+        private_subnet_az3_id: "{{ private_subnet_az3.subnet.id }}"
+
+    - name: "Creating security group for bastion server"
+      ec2_group:
+        name: "bastion_sg"
+        description: "bastion_sg"
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: bastion_sg
+
+    - name: "Set bastion security group id in variable"
+      set_fact:
+        bastion_sg_id: "{{ bastion_sg.group_id }}"
+
+    - name: "Creating security group for web server"
+      ec2_group:
+        name: "webserver_sg"
+        description: "webserver_sg"
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 80
+              - 443
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            ports:
+              - 22
+            group_id: "{{ bastion_sg_id }}"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: webserver_sg
+
+    - name: "Set bastion security group id in variable"
+      set_fact:
+        webserver_sg_id: "{{ webserver_sg.group_id }}"
+
+    - name: "Creating security group for database server"
+      ec2_group:
+        name: "DBserver_sg"
+        description: "DBserver_sg"
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 3306
+            group_id: "{{ webserver_sg_id }}"
+          - proto: tcp
+            ports:
+              - 22
+            group_id: "{{ bastion_sg_id }}"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: DBserver_sg
+
+    - name: "Set bastion security group id in variable"
+      set_fact:
+        DBserver_sg_id: "{{ DBserver_sg.group_id }}"
+
+    - name: "Create Amazon linux EC2 instance - Bastion"
+      ec2:
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image: "{{ image }}"
+        region: "{{ region }}"
+        zone: "{{ region }}a"
+        vpc_subnet_id: "{{ public_subnet_az1_id }}"
+        group: bastion_sg
+        assign_public_ip: yes
+        volumes:
+          - device_name: /dev/xvda
+            volume_type: gp2
+            volume_size: 8
+        wait: yes
+        count_tag:
+          Name: "bastion_server"
+        instance_tags:
+          Name: "bastion_server"
+        exact_count: 1
+      register: ec2_result
+
+    - name: "Set ec2 instance id in variable"
+      set_fact:
+        ec2_id: "{{ ec2_result.tagged_instances[0].id }}"
+
+
+    - name: "Creating AMI for bastion instance"
+      ignore_errors: yes
+      ec2_ami:
+        state: present
+        region: "{{ region }}"
+        instance_id: "{{ ec2_id }}"
+        wait: yes
+        name: "bastion_ami_{{ ansible_date_time.date }}"
+        no_reboot: yes
+
+    - ec2_ami_facts:
+        region: "{{ region }}"
+        filters:
+          name: "bastion_ami_{{ ansible_date_time.date }}"
+      register: bastion_ami_status
+
+    - name: "Copy AMI for bastion instance to another region"
+      ec2_ami_copy:
+        name: new_bastion_AMI
+        source_region: "{{ region }}"
+        region: "us-west-1"
+        source_image_id: "{{ bastion_ami_status.images[0].image_id }}"
+        wait: yes
+        tags:
+          Name: "bastion_ami_{{ ansible_date_time.date }}"
+
+
+
+
+
+
